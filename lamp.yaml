@@ -1,0 +1,217 @@
+heat_template_version: 2013-05-23
+
+description: 
+  Create a new neutron network plus a router to the public network. 
+  Deploy a LAMP stack (seperate DB and Apache) into the new network.   
+  Assign floating IP addresses to each server so they are routable from the public network.
+
+parameters:
+  key_name:
+    type: string
+    description: Name of keypair to assign to servers
+    default: nvaughn
+  image:
+    type: string
+    description: Name of image to use for servers
+    default: b0a3e0e7-b5ac-4c31-8d9b-3cdd41b56892 
+  flavor:
+    type: string
+    description: Flavor to use for servers
+    default: m1.small
+    constraints:
+      - allowed_values: [m1.small, m1.medium, m1.large]
+  private_net_name:
+    type: string
+    description: Name of private network to be created
+    default: web_net
+  public_net_id:
+    type: string
+    description: ID of public network for which floating IP addresses will be allocated private_net_name
+    type: string
+    description: Name of private network to be created
+    default: bdce9971-f553-4625-8c0b-038f45e26ad9
+  private_net_cidr:
+    type: string
+    description: Private network address (CIDR notation)
+    default: 192.168.2.0/24
+  private_net_gateway:
+    type: string
+    description: Private network gateway address
+    default: 192.168.2.1
+  private_net_pool_start:
+    type: string
+    description: Start of private network IP address allocation pool
+    default: 192.168.2.100
+  private_net_pool_end:
+    type: string
+    default: 192.168.2.110
+    description: End of private network IP address allocation pool
+  nameservers:
+    type: comma_delimited_list
+    default: 75.75.75.75,76.76.76.76
+  ntp_server:
+    type: string
+    description: NTP Server IP address
+    default: 188.26.14.105
+
+
+resources:
+
+  securitygroup:
+    type: AWS::EC2::SecurityGroup
+    properties:
+      GroupDescription: 'Enable HTTP access via port 80 plus SSH access'
+      SecurityGroupIngress:
+        - IpProtocol: 'icmp'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: 'tcp'
+          FromPort: '80'
+          ToPort: '80'
+          CidrIp: '0.0.0.0/0'
+        - IpProtocol: 'tcp'
+          FromPort: '22'
+          ToPort : '22'
+          CidrIp : '0.0.0.0/0'
+
+  private_net:
+    type: OS::Neutron::Net
+    properties:
+      name: { get_param: private_net_name }
+
+  private_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network_id: { get_resource: private_net }
+      cidr: { get_param: private_net_cidr }
+      gateway_ip: { get_param: private_net_gateway }
+      allocation_pools:
+        - start: { get_param: private_net_pool_start }
+          end: { get_param: private_net_pool_end }
+
+  router:
+    type: OS::Neutron::Router
+
+  router_gateway:
+    type: OS::Neutron::RouterGateway
+    properties:
+      router_id: { get_resource: router }
+      network_id: { get_param: public_net_id }
+
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router_id: { get_resource: router }
+      subnet_id: { get_resource: private_subnet }
+
+  server1:
+    type: OS::Nova::Server
+    properties:
+      name: mysql
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: server1_port }
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+
+            echo "Add local hostname with floating IP to /etc/hosts"
+            fixedip=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+            fqdn=$(curl -s http://169.254.169.254/latest/meta-data/public-hostname)
+            hostname=$(echo $fqdn | cut -d"." -f1)
+            echo -e $fixedip'\t'$fqdn'\t'$hostname >> /etc/hosts
+
+            echo "Changing hostname to public FQDN"
+            hostname $fqdn
+
+            echo "Flush iptables"
+            iptables -F
+
+            echo "nameserver 75.75.75.75" > /etc/resolv.conf
+            echo "nameserver 76.76.76.76" >> /etc/resolv.conf
+            echo "Installing packages"
+            yum install mysql mysql-server -y
+
+            echo "Install Complete"
+
+          params:
+            $ntp_server: { get_param: ntp_server }
+
+  server1_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_net }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+
+  server1_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net_id }
+      port_id: { get_resource: server1_port }
+
+  server2:
+    type: OS::Nova::Server
+    properties:
+      name: apache
+      image: { get_param: image }
+      flavor: { get_param: flavor }
+      key_name: { get_param: key_name }
+      networks:
+        - port: { get_resource: server2_port }
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+
+            echo "Add local hostname with floating IP to /etc/hosts"
+            fixedip=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+            fqdn=$(curl -s http://169.254.169.254/latest/meta-data/public-hostname)
+            hostname=$(echo $fqdn | cut -d"." -f1)
+            echo -e $fixedip'\t'$fqdn'\t'$hostname >> /etc/hosts
+
+            echo "Changing hostname to public FQDN"
+            hostname $fqdn
+
+            echo "Flush iptables"
+            iptables -F
+            echo "nameserver 75.75.75.75" > /etc/resolv.conf
+            echo "nameserver 76.76.76.76" >> /etc/resolv.conf
+            echo "Installing packages"
+            yum install httpd -y
+
+            echo "Install Complete"
+
+          params:
+            $ntp_server: { get_param: ntp_server }
+
+  server2_port:
+    type: OS::Neutron::Port
+    properties:
+      network_id: { get_resource: private_net }
+      fixed_ips:
+        - subnet_id: { get_resource: private_subnet }
+
+  server2_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network_id: { get_param: public_net_id }
+      port_id: { get_resource: server2_port }
+
+outputs:
+  server1_private_ip:
+    description: IP address of server1 in private network
+    value: { get_attr: [ server1, first_address ] }
+  server1_public_ip:
+    description: Floating IP address of server1 in public network
+    value: { get_attr: [ server1_floating_ip, floating_ip_address ] }
+  server2_private_ip:
+    description: IP address of server2 in private network
+    value: { get_attr: [ server2, first_address ] }
+  server2_public_ip:
+    description: Floating IP address of server2 in public network
+    value: { get_attr: [ server2_floating_ip, floating_ip_address ] }
